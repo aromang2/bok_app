@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
 import streamlit as st
 
@@ -40,40 +44,65 @@ def _apply(col: Col, s: pd.Series) -> pd.Series:
     return (s * col.scale).dropna().rename(col.name)
 
 
-@st.cache_data(ttl=TTL, show_spinner=False)
-def _series(stat: str, cycle: str, item: str) -> pd.Series:
-    """원천 시계열 1개 = ECOS 호출 1회. 같은 시계열은 지표가 달라도 캐시를 공유한다."""
-    return ecos.series(stat, cycle, item)
+# 원천 시계열 캐시: (통계표, 주기, 항목) → (받은 시각, Series).
+# 스레드에서 병렬로 채우기 위해 st.cache_data 대신 프로세스 전역 dict를 쓴다(모든 세션이 공유).
+_RAW: dict[tuple[str, str, str], tuple[float, pd.Series]] = {}
+_LOCK = threading.Lock()
+MAX_WORKERS = 6  # 동시 호출 수 (ECOS 한도 3분 300회 고려)
 
 
-def _fetch(ind: Indicator) -> pd.DataFrame:
-    parts = [_apply(c, _series(c.stat, c.cycle, c.item)) for c in ind.columns]
+def _series(key: tuple[str, str, str]) -> pd.Series:
+    with _LOCK:
+        hit = _RAW.get(key)
+    if hit and time.time() - hit[0] < TTL:
+        return hit[1]
+    s = ecos.series(*key)
+    with _LOCK:
+        _RAW[key] = (time.time(), s)
+    return s
+
+
+def clear_cache() -> None:
+    with _LOCK:
+        _RAW.clear()
+
+
+def _build(ind: Indicator) -> pd.DataFrame:
+    parts = [_apply(c, _series((c.stat, c.cycle, c.item))) for c in ind.columns]
     df = pd.concat(parts, axis=1).sort_index()
     df.index.name = "날짜"
     return df
 
 
-@st.cache_data(ttl=TTL, show_spinner=False)
-def load(ind_id: str) -> pd.DataFrame:
-    return _fetch(INDICATORS[ind_id])
-
-
 def load_many(ids: tuple[str, ...]) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
-    """여러 지표를 순서대로 받는다.
+    """여러 지표를 받는다. 필요한 원천 시계열을 중복 없이 모아 병렬로 호출한다."""
+    keys = list(dict.fromkeys((c.stat, c.cycle, c.item) for i in ids for c in INDICATORS[i].columns))
+    failed: dict[tuple, Exception] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for key, fut in [(k, pool.submit(_series, k)) for k in keys]:
+            try:
+                fut.result()
+            except ecos.EcosError as exc:
+                failed[key] = exc
 
-    Streamlit 캐시는 스크립트 스레드에서 호출해야 세션 간에 공유되므로 병렬화하지 않는다.
-    첫 로딩 이후에는 캐시(1시간)에서 바로 읽고, ECOS 호출 한도(3분 300회)도 지킬 수 있다.
-    """
     data, errors = {}, {}
     for i in ids:
-        try:
-            data[i] = load(i)
-        except ecos.EcosRateLimit as exc:
-            errors[INDICATORS[i].name] = f"ERROR-602 {exc}"
-            break  # 한도 초과면 나머지도 실패하므로 바로 중단
-        except ecos.EcosError as exc:
-            errors[INDICATORS[i].name] = str(exc)
+        ind = INDICATORS[i]
+        bad = [failed[(c.stat, c.cycle, c.item)] for c in ind.columns if (c.stat, c.cycle, c.item) in failed]
+        if bad:
+            exc = bad[0]
+            errors[ind.name] = f"ERROR-602 {exc}" if isinstance(exc, ecos.EcosRateLimit) else str(exc)
+        else:
+            data[i] = _build(ind)
     return data, errors
+
+
+def load(ind_id: str) -> pd.DataFrame:
+    data, errors = load_many((ind_id,))
+    if errors:
+        msg = next(iter(errors.values()))
+        raise ecos.EcosRateLimit(msg) if msg.startswith("ERROR-602") else ecos.EcosError(msg)
+    return data[ind_id]
 
 
 def list_indicators() -> pd.DataFrame:
@@ -103,6 +132,5 @@ def show_error(errors: dict[str, str]) -> None:
         detail = "  \n".join(f"- **{k}**: {v}" for k, v in errors.items())
         st.error(f"데이터를 불러오지 못한 지표가 있습니다.  \n{detail}", icon="⚠️")
     if st.button("다시 시도", key=f"retry-{'-'.join(errors)}"):
-        _series.clear()
-        load.clear()
+        clear_cache()
         st.rerun()

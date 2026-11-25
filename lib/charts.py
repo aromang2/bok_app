@@ -102,6 +102,10 @@ def series_chart(df: pd.DataFrame, units: dict[str, str], kind: str = "라인", 
         fig.update_layout(bargap=0.2, barmode="group")
     if slider:
         add_range_slider(fig)
+    elif len(df.columns) > 1:
+        # 작은 차트는 범례가 제목과 겹치지 않도록 아래로
+        fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0),
+                          margin=dict(b=40))
     return fig
 
 

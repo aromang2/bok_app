@@ -50,6 +50,7 @@ def kpi(s: pd.Series, title: str, unit: str, decimals: int = 2) -> None:
         f"{last:,.{decimals}f} {unit}".strip(),
         delta=f"{delta:+,.{decimals}f}" if delta else "변동 없음",
         delta_color=color,
+        delta_arrow="auto" if delta else "off",
         delta_description=f"{DELTA_LABEL[freq]} · {fmt_when(s.index[-1], freq)}",
         chart_data=s.iloc[-SPARK_POINTS[freq]:].round(4).tolist(),
         chart_type="line",
